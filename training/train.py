@@ -211,7 +211,12 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
     This stub returns ``mel_clean`` unchanged so the trainer runs without
     augmentation until you add the above (or your own variant).
     """
-    return mel_clean
+
+    # TODO: Change the given implementation here:
+    B = mel_clean.size(0)
+    snr_db = (torch.rand(B,1,1, device=device) * (snr_range[1] - snr_range[0]) + snr_range[0])
+    gain_offset = -snr_db * (np.log(10.0) / 20.0)
+    return torch.logaddexp(mel_clean, mel_noise + gain_offset)
 
 
 # ═══════════════════════════════════════════════════════════════════════
