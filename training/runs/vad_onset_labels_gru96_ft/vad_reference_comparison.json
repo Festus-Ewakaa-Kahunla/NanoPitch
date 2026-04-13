@@ -1,0 +1,34 @@
+{
+  "baseline_gru96": {
+    "vs_original_vad": {
+      "acc": 0.94561,
+      "precision": 0.9545347575404971,
+      "recall": 0.9397481030499224,
+      "pred_voiced_frac": 0.5099133333333333,
+      "ref_voiced_frac": 0.5179366666666667
+    },
+    "vs_f0_voicing": {
+      "acc": 0.8052266666666666,
+      "precision": 0.9546524245950292,
+      "recall": 0.7393080614786465,
+      "pred_voiced_frac": 0.5099133333333333,
+      "ref_voiced_frac": 0.65844
+    }
+  },
+  "new_vad_onset_labels_gru96_ft": {
+    "vs_original_vad": {
+      "acc": 0.8197866666666667,
+      "precision": 0.746277291355732,
+      "recall": 0.9879393233406916,
+      "pred_voiced_frac": 0.6856566666666667,
+      "ref_voiced_frac": 0.5179366666666667
+    },
+    "vs_f0_voicing": {
+      "acc": 0.93691,
+      "precision": 0.9341458553114532,
+      "recall": 0.9727588441366463,
+      "pred_voiced_frac": 0.6856566666666667,
+      "ref_voiced_frac": 0.65844
+    }
+  }
+}
