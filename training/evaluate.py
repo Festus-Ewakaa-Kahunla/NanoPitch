@@ -41,7 +41,9 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from model import NanoPitch, viterbi_decode, viterbi_decode_realtime, PITCH_BINS
+from model import (NanoPitch, viterbi_decode, viterbi_decode_realtime,
+                   DEFAULT_ONSET_PENALTY, DEFAULT_VOICING_THRESHOLD,
+                   PITCH_BINS)
 
 
 def _pitch_metrics(f0_dec, f0_ref):
@@ -67,7 +69,10 @@ def _pitch_metrics(f0_dec, f0_ref):
             'gross_err': gross_err, 'median_cents': median_cents}
 
 
-def evaluate_model(model, test_path, device='cpu'):
+def evaluate_model(model, test_path, device='cpu', transition_width=12,
+                   voicing_threshold=DEFAULT_VOICING_THRESHOLD,
+                   onset_penalty=DEFAULT_ONSET_PENALTY,
+                   vad_threshold=0.5, vad_reference="vad"):
     """Run model on test.npz and return per-clip results.
 
     For each clip, reports metrics using BOTH decoders:
@@ -103,10 +108,33 @@ def evaluate_model(model, test_path, device='cpu'):
         f0_ref = f0_gt[i, :T].astype(np.float32)  # ground-truth f0 in Hz
 
         # Decode predictions with BOTH decoders
-        f0_offline = viterbi_decode(pred_pitch)
-        f0_realtime = viterbi_decode_realtime(pred_pitch)
+        f0_offline = viterbi_decode(
+            pred_pitch,
+            transition_width=transition_width,
+            voicing_threshold=voicing_threshold,
+            onset_penalty=onset_penalty,
+        )
+        f0_realtime = viterbi_decode_realtime(
+            pred_pitch,
+            transition_width=transition_width,
+            voicing_threshold=voicing_threshold,
+            onset_penalty=onset_penalty,
+        )
 
-        vad_acc = float(np.mean((pred_vad > 0.5) == (vad_ref > 0.5)))
+        vad_label = vad_ref > 0.5
+        f0_label = f0_ref > 0
+        if vad_reference == "vad":
+            vad_ref_label = vad_label
+        elif vad_reference == "f0":
+            vad_ref_label = f0_label
+        elif vad_reference == "union":
+            vad_ref_label = vad_label | f0_label
+        elif vad_reference == "intersection":
+            vad_ref_label = vad_label & f0_label
+        else:
+            raise ValueError(f"unknown VAD reference: {vad_reference}")
+
+        vad_acc = float(np.mean((pred_vad > vad_threshold) == vad_ref_label))
 
         row = {'clip': i, 'snr': float(snrs[i]), 'vad_acc': vad_acc}
         for prefix, f0_dec in [('offline', f0_offline), ('realtime', f0_realtime)]:
@@ -234,6 +262,18 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to .pth")
     parser.add_argument("--data-dir", default="../data")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--transition-width", type=int, default=12,
+                        help="max Viterbi pitch movement per frame, in pitch bins")
+    parser.add_argument("--voicing-threshold", type=float,
+                        default=DEFAULT_VOICING_THRESHOLD,
+                        help="initial voiced-state threshold for Viterbi")
+    parser.add_argument("--onset-penalty", type=float, default=DEFAULT_ONSET_PENALTY,
+                        help="Viterbi voiced/unvoiced transition penalty")
+    parser.add_argument("--vad-threshold", type=float, default=0.5,
+                        help="threshold used when scoring the VAD output")
+    parser.add_argument("--vad-reference", choices=["vad", "f0", "union", "intersection"],
+                        default="vad",
+                        help="reference labels used when scoring VAD accuracy")
     parser.add_argument("--csv", default=None, help="Save per-clip CSV")
     parser.add_argument("--json", default=None, help="Save summary JSON")
     args = parser.parse_args()
@@ -254,7 +294,16 @@ def main():
     # Run evaluation
     test_path = os.path.join(args.data_dir, 'test.npz')
     t0 = time.time()
-    results = evaluate_model(model, test_path, device=args.device)
+    results = evaluate_model(
+        model,
+        test_path,
+        device=args.device,
+        transition_width=args.transition_width,
+        voicing_threshold=args.voicing_threshold,
+        onset_penalty=args.onset_penalty,
+        vad_threshold=args.vad_threshold,
+        vad_reference=args.vad_reference,
+    )
     dt = time.time() - t0
 
     # Report

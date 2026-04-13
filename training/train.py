@@ -104,6 +104,39 @@ parser.add_argument("--w-vad", type=float, default=0.1,
                     help="weight for VAD loss")
 parser.add_argument("--w-pitch", type=float, default=1.0,
                     help="weight for pitch loss")
+parser.add_argument("--vad-pos-weight", type=float, default=1.0,
+                    help="upweight voiced frames in VAD loss (try 2.0-3.0)")
+parser.add_argument("--vad-focal-gamma", type=float, default=0.0,
+                    help="focal-loss gamma for VAD loss; 0 disables focal weighting")
+parser.add_argument("--vad-label-source", choices=["vad", "f0", "union", "intersection"],
+                    default="vad",
+                    help="target used for VAD loss; union fixes frames with f0 but missing VAD")
+parser.add_argument("--pitch-voicing-source", choices=["vad", "f0", "union", "intersection"],
+                    default="vad",
+                    help="frame mask used for pitch loss; f0/union can fix under-labeled voiced frames")
+parser.add_argument("--vad-boundary-window", type=int, default=0,
+                    help="frames around voiced/unvoiced changes to upweight in VAD loss")
+parser.add_argument("--vad-boundary-weight", type=float, default=1.0,
+                    help="VAD loss multiplier near voiced/unvoiced boundaries")
+parser.add_argument("--pitch-boundary-window", type=int, default=0,
+                    help="frames around voiced/unvoiced changes to upweight in pitch loss")
+parser.add_argument("--pitch-boundary-weight", type=float, default=1.0,
+                    help="pitch loss multiplier near voiced/unvoiced boundaries")
+parser.add_argument("--pitch-loss-normalize", choices=["batch", "voiced"], default="batch",
+                    help="normalize pitch loss over all frames or active voiced-weight frames")
+parser.add_argument("--balanced-sampling", action="store_true",
+                    help="sample clean clips with probability biased toward voiced-frame content")
+parser.add_argument("--sampling-label-source", choices=["vad", "f0", "union", "intersection"],
+                    default="union",
+                    help="voicing signal used to build balanced-sampling probabilities")
+parser.add_argument("--balanced-sampling-floor", type=float, default=0.1,
+                    help="minimum clean-clip sampling weight so quiet clips are still seen")
+parser.add_argument("--scheduler", choices=["constant", "cosine"], default="constant",
+                    help="learning-rate schedule")
+parser.add_argument("--cosine-t0-epochs", type=int, default=10,
+                    help="epochs before first cosine restart when --scheduler cosine")
+parser.add_argument("--eta-min", type=float, default=1e-5,
+                    help="minimum learning rate for cosine scheduler")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -121,8 +154,12 @@ class NanoPitchDataset(Dataset):
     function is implemented.
     """
 
-    def __init__(self, data_dir, seq_len=200):
+    def __init__(self, data_dir, seq_len=200, balanced_sampling=False,
+                 sampling_label_source="union", balanced_sampling_floor=0.1):
         self.seq_len = seq_len
+        self.balanced_sampling = balanced_sampling
+        self.sampling_label_source = sampling_label_source
+        self.balanced_sampling_floor = balanced_sampling_floor
 
         # Load pre-extracted features (stored as float16 to save disk space)
         print("Loading clean.npz...")
@@ -146,6 +183,12 @@ class NanoPitchDataset(Dataset):
         print(f"  Noise: {len(self.noise_mel):,} frames, "
               f"{len(self.noise_segments)} usable segments")
 
+        self.clean_segment_probs = None
+        if self.balanced_sampling:
+            self.clean_segment_probs = self._build_sampling_probs()
+            print(f"  Balanced sampling: {self.sampling_label_source} labels, "
+                  f"floor={self.balanced_sampling_floor:g}")
+
         self.rng = np.random.default_rng()
 
     def _build_segments(self, lengths, min_len):
@@ -158,13 +201,42 @@ class NanoPitchDataset(Dataset):
             offset += length
         return segments
 
+    def _voiced_mask(self, start, end, source):
+        """Return a boolean voicing mask from VAD labels, f0, or both."""
+        vad = self.clean_vad[start:end] > 0.5
+        f0 = self.clean_f0[start:end] > 0
+        if source == "vad":
+            return vad
+        if source == "f0":
+            return f0
+        if source == "union":
+            return vad | f0
+        if source == "intersection":
+            return vad & f0
+        raise ValueError(f"unknown voicing source: {source}")
+
+    def _build_sampling_probs(self):
+        """Bias sampling toward voiced clips without dropping quiet examples."""
+        floor = max(0.0, float(self.balanced_sampling_floor))
+        weights = np.empty(len(self.clean_segments), dtype=np.float64)
+        for i, (start, end) in enumerate(self.clean_segments):
+            voiced_fraction = self._voiced_mask(start, end, self.sampling_label_source).mean()
+            weights[i] = floor + voiced_fraction
+        total = weights.sum()
+        if total <= 0:
+            return None
+        return weights / total
+
     def __len__(self):
         # Return a reasonable epoch size (not too long for CPU training)
         return min(len(self.clean_segments) * 3, 10000)
 
     def __getitem__(self, idx):
         # Pick a random clean segment and extract a random window
-        seg_idx = self.rng.integers(len(self.clean_segments))
+        if self.clean_segment_probs is None:
+            seg_idx = self.rng.integers(len(self.clean_segments))
+        else:
+            seg_idx = self.rng.choice(len(self.clean_segments), p=self.clean_segment_probs)
         start, end = self.clean_segments[seg_idx]
         offset = self.rng.integers(0, end - start - self.seq_len + 1)
         s = start + offset
@@ -208,10 +280,88 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
         gain_offset = -snr_db * (np.log(10.0) / 20.0)
         return torch.logaddexp(mel_clean, mel_noise + gain_offset)
 
-    This stub returns ``mel_clean`` unchanged so the trainer runs without
-    augmentation until you add the above (or your own variant).
+    The implementation below applies the suggested log-domain mixing so the
+    trainer sees a different noisy mixture for each batch.
     """
-    return mel_clean
+    B = mel_clean.size(0)
+    snr_min, snr_max = snr_range
+    snr_db = (
+        torch.rand(B, 1, 1, device=device, dtype=mel_clean.dtype)
+        * (snr_max - snr_min)
+        + snr_min
+    )
+    gain_offset = -snr_db * (np.log(10.0) / 20.0)
+    return torch.logaddexp(mel_clean, mel_noise + gain_offset)
+
+
+def make_voicing_target(vad_target, f0_target, source):
+    """Build a frame-level voicing target from VAD labels, f0, or both."""
+    vad_voiced = vad_target > 0.5
+    f0_voiced = f0_target > 0
+
+    if source == "vad":
+        voiced = vad_voiced
+    elif source == "f0":
+        voiced = f0_voiced
+    elif source == "union":
+        voiced = vad_voiced | f0_voiced
+    elif source == "intersection":
+        voiced = vad_voiced & f0_voiced
+    else:
+        raise ValueError(f"unknown voicing source: {source}")
+
+    return voiced.to(dtype=vad_target.dtype)
+
+
+def boundary_frame_weight(voicing_target, window, weight):
+    """Upweight frames near voiced/unvoiced transitions."""
+    if window <= 0 or weight == 1.0:
+        return torch.ones_like(voicing_target)
+
+    voiced = voicing_target > 0.5
+    boundary = torch.zeros_like(voiced)
+    boundary[:, 0] = voiced[:, 0]
+    boundary[:, 1:] = voiced[:, 1:] != voiced[:, :-1]
+
+    kernel = 2 * int(window) + 1
+    expanded = torch.nn.functional.max_pool1d(
+        boundary.to(dtype=voicing_target.dtype).unsqueeze(1),
+        kernel_size=kernel,
+        stride=1,
+        padding=int(window),
+    ).squeeze(1)
+    return torch.where(expanded > 0, torch.full_like(voicing_target, weight),
+                       torch.ones_like(voicing_target))
+
+
+def weighted_vad_bce(pred_vad, vad_target, bce, args, frame_weight=None):
+    """VAD BCE with optional voiced-frame, focal, and boundary weighting."""
+    vad_bce = bce(pred_vad, vad_target)
+
+    if args.vad_pos_weight != 1.0:
+        pos_weight = torch.as_tensor(
+            args.vad_pos_weight, device=vad_target.device, dtype=vad_bce.dtype
+        )
+        vad_bce = vad_bce * torch.where(vad_target > 0.5, pos_weight, 1.0)
+
+    if args.vad_focal_gamma > 0.0:
+        pred = pred_vad.clamp(1e-4, 1.0 - 1e-4)
+        pt = torch.where(vad_target > 0.5, pred, 1.0 - pred)
+        vad_bce = vad_bce * (1.0 - pt).pow(args.vad_focal_gamma)
+
+    if frame_weight is not None:
+        vad_bce = vad_bce * frame_weight
+
+    return vad_bce.mean()
+
+
+def weighted_pitch_bce(pred_pitch, pitch_target, pitch_frame_weight, bce, normalize):
+    """Pitch BCE with optional normalization over voiced-weighted frames."""
+    pitch_bce = pitch_frame_weight.unsqueeze(-1) * bce(pred_pitch, pitch_target)
+    if normalize == "voiced":
+        denom = pitch_frame_weight.sum().clamp_min(1.0) * pred_pitch.size(-1)
+        return pitch_bce.sum() / denom
+    return pitch_bce.mean()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -231,6 +381,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         mel_clean = mel_clean.to(device)
         mel_noise = mel_noise.to(device)
         vad_target = vad_target.to(device)
+        f0_target_device = f0_target.to(device)
         B = mel_clean.size(0)
         T = mel_clean.size(1)
 
@@ -250,13 +401,22 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         pred_vad, pred_pitch, _ = model(mel_mix)
 
         # ── Loss Computation ──
-        # VAD loss: standard binary cross-entropy
-        vad_loss = bce(pred_vad.squeeze(-1), vad_target).mean()
+        # VAD loss: BCE, optionally reweighted to fight voiced/unvoiced imbalance.
+        vad_loss_target = make_voicing_target(
+            vad_target, f0_target_device, args.vad_label_source)
+        pitch_voicing_target = make_voicing_target(
+            vad_target, f0_target_device, args.pitch_voicing_source)
+        vad_frame_weight = boundary_frame_weight(
+            vad_loss_target, args.vad_boundary_window, args.vad_boundary_weight)
+        vad_loss = weighted_vad_bce(
+            pred_vad.squeeze(-1), vad_loss_target, bce, args, vad_frame_weight)
 
         # Pitch loss: BCE on the 360-dim posteriorgram, but weighted
         # by VAD — we don't penalize pitch errors on silent frames
-        voiced_weight = vad_target.unsqueeze(-1)  # (B, T, 1)
-        pitch_loss = (voiced_weight * bce(pred_pitch, pitch_target)).mean()
+        pitch_frame_weight = pitch_voicing_target * boundary_frame_weight(
+            pitch_voicing_target, args.pitch_boundary_window, args.pitch_boundary_weight)
+        pitch_loss = weighted_pitch_bce(
+            pred_pitch, pitch_target, pitch_frame_weight, bce, args.pitch_loss_normalize)
 
         # Combined loss (weighted sum)
         loss = args.w_vad * vad_loss + args.w_pitch * pitch_loss
@@ -264,7 +424,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         # ── Backward Pass ──
         optimizer.zero_grad()  # clear old gradients
         loss.backward()        # compute new gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # prevent exploding gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # prevent exploding gradients
         optimizer.step()       # update weights
         scheduler.step()       # decay learning rate
 
@@ -272,6 +432,10 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         running['loss'] += loss.item()
         running['vad'] += vad_loss.item()
         running['pitch'] += pitch_loss.item()
+        global_step = (epoch - 1) * len(dataloader) + n_batches
+        if n_batches % 10 == 0:
+            writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
+            writer.add_scalar("train/lr_step", scheduler.get_last_lr()[0], global_step)
         n_batches += 1
 
         pbar.set_postfix(
@@ -372,7 +536,7 @@ def evaluate(model, data_dir, writer, epoch, device, args):
 
     results = {}
     print(f"\n  {'Condition':<10s}  {'VAD Acc':>8s}  {'VDR':>8s}  {'RPA':>8s}")
-    print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*8}")
+    print(f"  {'-'*10}  {'-'*8}  {'-'*8}  {'-'*8}")
 
     for snr in sorted(by_snr.keys(), key=lambda x: x if np.isfinite(x) else 1e6):
         c = by_snr[snr]
@@ -442,7 +606,13 @@ def main():
     model.to(device)
 
     # Create data pipeline
-    dataset = NanoPitchDataset(data_dir, seq_len=args.seq_len)
+    dataset = NanoPitchDataset(
+        data_dir,
+        seq_len=args.seq_len,
+        balanced_sampling=args.balanced_sampling,
+        sampling_label_source=args.sampling_label_source,
+        balanced_sampling_floor=args.balanced_sampling_floor,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, drop_last=True,
                             pin_memory=(device.type == "cuda"))
@@ -466,8 +636,17 @@ def main():
     #
     # Call scheduler.step() once per batch (inside train_one_epoch) or once
     # per epoch (here, after train_one_epoch returns), depending on the type.
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: 1.0)  # constant LR — replace me
+    steps_per_epoch = max(1, len(dataloader))
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, args.cosine_t0_epochs * steps_per_epoch),
+            T_mult=2,
+            eta_min=args.eta_min,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: 1.0)
 
     # TensorBoard writer for visualizing training progress
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))

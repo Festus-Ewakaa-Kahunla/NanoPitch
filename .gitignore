@@ -1,4 +1,7 @@
 data/
+training/runs/
+deployment/web/model*.json
+deployment/web/server.*.log
 
 # Python caches
 __pycache__/

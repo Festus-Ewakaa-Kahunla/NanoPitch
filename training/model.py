@@ -75,6 +75,8 @@ N_MELS = 40  # number of mel spectrogram bands
 # cond_size and gru_size must not exceed this, or the exported model
 # will crash in the browser. Matches NC_MAX_LAYER_SIZE in nanopitch.h.
 MAX_LAYER_SIZE = 512
+DEFAULT_VOICING_THRESHOLD = 0.3
+DEFAULT_ONSET_PENALTY = 0.75
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -142,8 +144,9 @@ def f0_to_posteriorgram(f0_hz, n_frames=None, sigma_bins=1.2):
     return posteriorgram
 
 
-def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
-                   onset_penalty=2.0):
+def viterbi_decode(posteriorgram, transition_width=12,
+                   voicing_threshold=DEFAULT_VOICING_THRESHOLD,
+                   onset_penalty=DEFAULT_ONSET_PENALTY):
     """Decode a pitch posteriorgram into a smooth f0 track using Viterbi.
 
     The Viterbi algorithm finds the most likely sequence of pitch states
@@ -246,7 +249,8 @@ def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
 
 
 def viterbi_decode_realtime(posteriorgram, transition_width=12,
-                          voicing_threshold=0.3, onset_penalty=2.0):
+                          voicing_threshold=DEFAULT_VOICING_THRESHOLD,
+                          onset_penalty=DEFAULT_ONSET_PENALTY):
     """Realtime (greedy) Viterbi — matches the C/WASM deployment exactly.
 
     Unlike the offline version, this processes frames left-to-right and

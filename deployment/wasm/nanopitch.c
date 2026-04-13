@@ -788,10 +788,10 @@ static void dense_sigmoid(const float *x, float *out, int in_size, int out_size,
  *     Within the allowed range, all transitions are equally likely
  *     (uniform cost).
  *
- *   - Voiced -> unvoiced: incurs a penalty of -2.0 (in log space).
+ *   - Voiced -> unvoiced: incurs a penalty of -0.75 (in log space).
  *     This discourages frequent voiced/unvoiced switches (flutter).
  *
- *   - Unvoiced -> voiced: same -2.0 penalty ("onset" cost).
+ *   - Unvoiced -> voiced: same -0.75 penalty ("onset" cost).
  *
  *   - Unvoiced -> unvoiced: free (no penalty).
  *
@@ -813,6 +813,7 @@ static void dense_sigmoid(const float *x, float *out, int in_size, int out_size,
 #define PITCH_CENTS_PER_BIN 20.0f
 #define VITERBI_TRANSITION_WIDTH 12
 #define VITERBI_VOICING_THRESHOLD 0.3f
+#define VITERBI_ONSET_PENALTY 0.75f
 
 /*
  * Convert a pitch bin index to a frequency in Hz.
@@ -868,8 +869,8 @@ static void viterbi_step(NanoPitchState *st, const float *posterior, float *f0_o
      * For each voiced state s (0..N-1):
      *   1. Search the allowed predecessor neighborhood [s-12, s+12]
      *      to find the previous voiced state with the highest score.
-     *   2. Also check if coming from "unvoiced" (state N) with a
-     *      -2.0 onset penalty would be better.
+     *   2. Also check if coming from "unvoiced" (state N) with the
+     *      onset penalty would be better.
      *   3. Choose the better of the two and add the current frame's
      *      observation: log(posterior[s] + epsilon).
      */
@@ -892,8 +893,8 @@ static void viterbi_step(NanoPitchState *st, const float *posterior, float *f0_o
             }
         }
 
-        /* Transition from unvoiced, with a -2.0 "onset" penalty */
-        float from_unvoiced = prev[N] - 2.0f; /* onset penalty */
+        /* Transition from unvoiced, with the tuned "onset" penalty */
+        float from_unvoiced = prev[N] - VITERBI_ONSET_PENALTY;
 
         if (best_val >= from_unvoiced) {
             curr[s] = best_val + log_obs;
@@ -905,7 +906,7 @@ static void viterbi_step(NanoPitchState *st, const float *posterior, float *f0_o
     }
 
     /*
-     * Unvoiced state: can come from any voiced state (with -2.0 "offset"
+     * Unvoiced state: can come from any voiced state (with the same offset
      * penalty) or from the previous unvoiced state (free transition).
      */
     float best_voiced = -1e30f;
@@ -916,7 +917,7 @@ static void viterbi_step(NanoPitchState *st, const float *posterior, float *f0_o
             best_voiced_idx = p;
         }
     }
-    best_voiced -= 2.0f; /* offset penalty */
+    best_voiced -= VITERBI_ONSET_PENALTY;
 
     if (prev[N] >= best_voiced) {
         curr[N] = prev[N] + unvoiced_obs;
