@@ -6,3 +6,13 @@ __pycache__/
 
 # macOS / editor noise
 .DS_Store
+
+# Virtual environment
+.venv/
+
+# Training outputs
+training/runs/
+*.pth
+
+# Generated docs
+findings.docx
