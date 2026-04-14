@@ -230,7 +230,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         # Move data to the training device (CPU or GPU)
         mel_clean = mel_clean.to(device)
         mel_noise = mel_noise.to(device)
-        vad_target = vad_target.to(device)
+        vad_target = (f0_target > 0).float().to(device) #changes /////
         B = mel_clean.size(0)
         T = mel_clean.size(1)
 
@@ -466,8 +466,11 @@ def main():
     #
     # Call scheduler.step() once per batch (inside train_one_epoch) or once
     # per epoch (here, after train_one_epoch returns), depending on the type.
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: 1.0)  # constant LR — replace me
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-5)
+
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(
+    #     optimizer, lr_lambda=lambda step: 1.0)   (Previous implementation)
 
     # TensorBoard writer for visualizing training progress
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
