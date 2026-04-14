@@ -45,6 +45,7 @@ import os
 import sys
 import time
 import warnings
+import random
 
 import numpy as np
 import torch
@@ -216,7 +217,14 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
     B = mel_clean.size(0)
     snr_db = (torch.rand(B,1,1, device=device) * (snr_range[1] - snr_range[0]) + snr_range[0])
     gain_offset = -snr_db * (np.log(10.0) / 20.0)
-    return torch.logaddexp(mel_clean, mel_noise + gain_offset)
+
+
+    mel_mixed = torch.logaddexp(mel_clean, mel_noise + gain_offset)
+    # Frequency masking: zero out F consecutive mel bands, starting at f0
+    F = 6
+    f0 = random.randint(0, N_MELS - F)
+    mel_mixed[:, :, f0:f0+F] = 0.0
+    return mel_mixed
 
 
 # ═══════════════════════════════════════════════════════════════════════
