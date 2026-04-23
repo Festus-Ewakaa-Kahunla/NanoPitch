@@ -99,12 +99,33 @@ parser.add_argument("--num-workers", type=int, default=0,
 # Data augmentation (used by augment_mel_batch once implemented)
 parser.add_argument("--snr-range", type=float, nargs=2, default=[-5.0, 20.0],
                     help="min/max SNR in dB for noise mixing (see augment_mel_batch)")
+parser.add_argument("--p-mixed", type=float, default=1.0,
+                    help="fraction of each batch that is noise-mixed (0=all clean, 1=all mixed, 0.5=half+half)")
+parser.add_argument("--specaugment-f", type=int, default=0,
+                    help="frequency-mask width in mel bins for training-time SpecAugment (0 disables)")
 
 # Loss weights — adjust to prioritize VAD vs pitch accuracy
 parser.add_argument("--w-vad", type=float, default=0.1,
                     help="weight for VAD loss")
 parser.add_argument("--w-pitch", type=float, default=1.0,
                     help="weight for pitch loss")
+
+# Focal loss parameters for VAD
+parser.add_argument("--focal-gamma", type=float, default=0.5,
+                    help="focal loss gamma: higher = more focus on hard frames (0 = plain weighted BCE)")
+parser.add_argument("--focal-pos-weight", type=float, default=2.3,
+                    help="focal loss positive class weight (upweights voiced frames; ~0.7/0.3 ≈ 2.3)")
+
+# Learning rate schedule
+parser.add_argument("--lr-schedule", type=str, default="constant",
+                    choices=["constant", "cosine"],
+                    help="LR schedule: 'constant' keeps LR flat; 'cosine' decays smoothly to 1e-5")
+parser.add_argument("--eval-viterbi-onset-penalty", type=float, default=0.5,
+                    help="onset/offset penalty for train-time eval Viterbi decoding")
+parser.add_argument("--eval-viterbi-voicing-threshold", type=float, default=0.1,
+                    help="initial voicing threshold for train-time eval Viterbi decoding")
+parser.add_argument("--eval-vad-viterbi-weight", type=float, default=2.0,
+                    help="VAD-guidance weight for train-time eval Viterbi decoding")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -184,7 +205,7 @@ class NanoPitchDataset(Dataset):
         return mel_clean, mel_noise, vad, f0
 
 
-def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
+def augment_mel_batch(mel_clean, mel_noise, snr_range, device, specaugment_f=0):
     """Training-time augmentation: mix clean and noise log-mel.
 
     Parameters
@@ -212,7 +233,6 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
     This stub returns ``mel_clean`` unchanged so the trainer runs without
     augmentation until you add the above (or your own variant).
     """
-
     # TODO: Change the given implementation here:
     B = mel_clean.size(0)
     snr_db = (torch.rand(B,1,1, device=device) * (snr_range[1] - snr_range[0]) + snr_range[0])
@@ -220,12 +240,29 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
 
 
     mel_mixed = torch.logaddexp(mel_clean, mel_noise + gain_offset)
-    # Frequency masking: zero out F consecutive mel bands, starting at f0
-    F = 6
-    f0 = random.randint(0, N_MELS - F)
-    mel_mixed[:, :, f0:f0+F] = 0.0
+
+    # Optional SpecAugment frequency masking for robustness.
+    if specaugment_f > 0:
+        F = min(int(specaugment_f), N_MELS)
+        if F > 0:
+            B = mel_mixed.size(0)
+            for b in range(B):
+                f0 = random.randint(0, N_MELS - F)
+                mel_mixed[b, :, f0:f0 + F] = 0.0
     return mel_mixed
 
+def focal_bce(pred, target, gamma=2.0, pos_weight=2.0):
+    # Clamp predictions to valid BCE range (avoids log(0) / numerical edge cases).
+    pred = pred.clamp(1e-7, 1.0 - 1e-7)
+    # Compute per-element BCE first, then apply focal modulation.
+    bce_per_elem = nn.functional.binary_cross_entropy(pred, target, reduction='none')
+    # pt = model's confidence: pred if target==1, else (1-pred)
+    pt = torch.where(target == 1, pred, 1 - pred)
+    # pos_weight upweights voiced (positive) frames for class imbalance
+    weight = torch.where(target == 1,
+                         torch.full_like(pt, pos_weight), torch.ones_like(pt))
+    # (1-pt)^gamma down-weights easy (high-confidence) frames, focusing on hard ones
+    return (weight * (1 - pt) ** gamma * bce_per_elem).mean()
 
 # ═══════════════════════════════════════════════════════════════════════
 # Training Loop (one epoch)
@@ -235,6 +272,10 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
                     epoch, device, args):
     model.train()  # enable dropout, batch norm, etc. (if any)
     bce = nn.BCELoss(reduction='none')  # per-element BCE, we'll weight manually
+    # focal_bce params: gamma=2 focuses gradient on hard (ambiguous onset/offset)
+    # frames; pos_weight=2.3 upweights voiced frames for VAD class imbalance.
+    focal_gamma = getattr(args, 'focal_gamma', 2.0)
+    focal_pos_weight = getattr(args, 'focal_pos_weight', 2.3)
     running = {'loss': 0, 'vad': 0, 'pitch': 0}
     n_batches = 0
 
@@ -243,32 +284,52 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         # Move data to the training device (CPU or GPU)
         mel_clean = mel_clean.to(device)
         mel_noise = mel_noise.to(device)
-        vad_target = vad_target.to(device)
+        vad_target = vad_target.to(device).float()
         B = mel_clean.size(0)
         T = mel_clean.size(1)
 
         # Build pitch posteriorgram target on-the-fly from f0 values.
         # This saves huge amounts of RAM (f0 is 1 float vs 360 for full posterior).
         pitch_target = torch.zeros(B, T, PITCH_BINS, device=device)
-        f0_np = f0_target.numpy()
+        f0_np = f0_target.cpu().numpy()
         for b in range(B):
             pg = f0_to_posteriorgram(f0_np[b], n_frames=T)
-            pitch_target[b] = torch.from_numpy(pg)
+            pitch_target[b] = torch.from_numpy(pg).to(device=device, dtype=pitch_target.dtype)
 
-        # ── Data augmentation (implement in augment_mel_batch) ──
-        mel_mix = augment_mel_batch(mel_clean, mel_noise, args.snr_range, device)
+        # ── Data augmentation — batch-level mixing ──
+        # p_mixed controls what fraction of each batch sees noisy mel.
+        # The first n_mixed rows get noise-mixed; the rest stay clean.
+        # p_mixed=1.0: all rows mixed (original behaviour)
+        # p_mixed=0.0: all rows clean only (curriculum phase 1)
+        # p_mixed=0.5: half clean, half mixed (Stage C)
+        p_mixed = getattr(args, 'p_mixed', 1.0)
+        n_mixed = int(round(B * p_mixed))
+        mel_mix = mel_clean.clone()
+        if n_mixed > 0:
+            mel_mix[:n_mixed] = augment_mel_batch(
+                mel_clean[:n_mixed], mel_noise[:n_mixed], args.snr_range, device,
+                specaugment_f=getattr(args, 'specaugment_f', 0))
 
         # ── Forward Pass ──
         # Causal convs → output same length as input, no trimming needed
         pred_vad, pred_pitch, _ = model(mel_mix)
 
         # ── Loss Computation ──
-        # VAD loss: standard binary cross-entropy
-        vad_loss = bce(pred_vad.squeeze(-1), vad_target).mean()
-
-        # Pitch loss: BCE on the 360-dim posteriorgram, but weighted
-        # by VAD — we don't penalize pitch errors on silent frames
-        voiced_weight = vad_target.unsqueeze(-1)  # (B, T, 1)
+        # VAD loss: focal BCE. Focal loss down-weights easy frames (clearly
+        # silent or clearly voiced) and concentrates gradient on hard frames
+        # (ambiguous onsets/offsets). pos_weight upweights voiced frames to
+        # counteract class imbalance (~62% voiced in clean.npz).
+        vad_loss = focal_bce(pred_vad.squeeze(-1), vad_target,
+                             gamma=focal_gamma, pos_weight=focal_pos_weight)
+        # Pitch loss: BCE on the 360-dim posteriorgram, weighted by the union
+        # of VAD and f0-presence. This rescues "quiet voiced" frames where the
+        # energy-threshold VAD label is 0 but RMVPE found a clear pitch (f0>0).
+        # Using max(vad, f0_voiced) means:
+        #   - loud voiced frames (vad=1, f0>0):  weight=1 (same as before)
+        #   - quiet voiced frames (vad=0, f0>0): weight=1 (newly included)
+        #   - truly silent frames (vad=0, f0=0): weight=0 (excluded, same as before)
+        f0_voiced = (f0_target.to(device) > 0).float()           # (B, T)
+        voiced_weight = torch.clamp(vad_target + f0_voiced, 0.0, 1.0).unsqueeze(-1)  # (B, T, 1)
         pitch_loss = (voiced_weight * bce(pred_pitch, pitch_target)).mean()
 
         # Combined loss (weighted sum)
@@ -279,7 +340,6 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         loss.backward()        # compute new gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # prevent exploding gradients
         optimizer.step()       # update weights
-        scheduler.step()       # decay learning rate
 
         # ── Logging ──
         running['loss'] += loss.item()
@@ -352,7 +412,13 @@ def evaluate(model, data_dir, writer, epoch, device, args):
         f0r = f0_all[i, :T].astype(np.float32)
 
         # Decode predicted posteriorgram to f0
-        f0d = viterbi_decode(pp)
+        f0d = viterbi_decode(
+            pp,
+            voicing_threshold=getattr(args, 'eval_viterbi_voicing_threshold', 0.3),
+            onset_penalty=getattr(args, 'eval_viterbi_onset_penalty', 2.0),
+            vad=pv,
+            vad_weight=getattr(args, 'eval_vad_viterbi_weight', 0.0),
+        )
 
         # VAD accuracy: fraction of frames with correct voice/silence label
         vacc = float(np.mean((pv > 0.5) == (vr > 0.5)))
@@ -464,23 +530,14 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                    betas=(0.8, 0.98), eps=1e-8)
 
-    # Learning rate scheduler — student exercise.
-    #
-    # The stub below holds the learning rate constant throughout training.
-    # Replace it with a real schedule to improve convergence — for example:
-    #
-    #   Cosine annealing with warm restarts (Loshchilov & Hutter, 2017):
-    #     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #         optimizer, T_0=10, T_mult=2, eta_min=1e-5)
-    #
-    #   Simple inverse-decay:
-    #     scheduler = torch.optim.lr_scheduler.LambdaLR(
-    #         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step))
-    #
-    # Call scheduler.step() once per batch (inside train_one_epoch) or once
-    # per epoch (here, after train_one_epoch returns), depending on the type.
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: 1.0)  # constant LR — replace me
+    # LR scheduler — chosen via --lr-schedule.
+    # "constant": flat LR throughout (safe default; GRU pitch heads converge better).
+    # "cosine": single smooth cosine decay from lr to eta_min=1e-5 over all epochs.
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-5)
+    else:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda e: 1.0)
 
     # TensorBoard writer for visualizing training progress
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
@@ -491,6 +548,7 @@ def main():
         t0 = time.time()
         train_loss = train_one_epoch(model, dataloader, optimizer, scheduler,
                                      writer, epoch, device, args)
+        scheduler.step()   # cosine annealing steps once per epoch
         dt = time.time() - t0
         print(f"  Epoch {epoch} done in {dt:.1f}s, loss={train_loss:.5f}")
 

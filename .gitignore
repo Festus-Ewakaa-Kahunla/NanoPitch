@@ -6,3 +6,6 @@ __pycache__/
 
 # macOS / editor noise
 .DS_Store
+/data_exploration/
+/data/
+/runs/

@@ -1,0 +1,2 @@
+name: "Uddhav Jain"
+note: "Trained from the NanoPitch baseline and added positive loss weighting to emphasize voiced/pitched frames (reducing unvoiced-dominant bias). Kept the model lightweight for realtime decoding; tuned the learning-rate schedule for steadier convergence and early-stopping on the validation metric. Checkpoint: runs/my_fourth_model/checkpoints/best.pth (submitted as weights.pth)."

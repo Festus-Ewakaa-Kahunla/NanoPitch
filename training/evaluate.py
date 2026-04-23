@@ -67,7 +67,11 @@ def _pitch_metrics(f0_dec, f0_ref):
             'gross_err': gross_err, 'median_cents': median_cents}
 
 
-def evaluate_model(model, test_path, device='cpu'):
+def evaluate_model(model, test_path, device='cpu',
+                   viterbi_onset_penalty=2.0,
+                   viterbi_voicing_threshold=0.3,
+                   vad_viterbi_weight=0.0,
+                   viterbi_voiced_bias=0.0):
     """Run model on test.npz and return per-clip results.
 
     For each clip, reports metrics using BOTH decoders:
@@ -103,8 +107,22 @@ def evaluate_model(model, test_path, device='cpu'):
         f0_ref = f0_gt[i, :T].astype(np.float32)  # ground-truth f0 in Hz
 
         # Decode predictions with BOTH decoders
-        f0_offline = viterbi_decode(pred_pitch)
-        f0_realtime = viterbi_decode_realtime(pred_pitch)
+        f0_offline = viterbi_decode(
+            pred_pitch,
+            voicing_threshold=viterbi_voicing_threshold,
+            onset_penalty=viterbi_onset_penalty,
+            vad=pred_vad,
+            vad_weight=vad_viterbi_weight,
+            voiced_bias=viterbi_voiced_bias,
+        )
+        f0_realtime = viterbi_decode_realtime(
+            pred_pitch,
+            voicing_threshold=viterbi_voicing_threshold,
+            onset_penalty=viterbi_onset_penalty,
+            vad=pred_vad,
+            vad_weight=vad_viterbi_weight,
+            voiced_bias=viterbi_voiced_bias,
+        )
 
         vad_acc = float(np.mean((pred_vad > 0.5) == (vad_ref > 0.5)))
 
@@ -234,6 +252,14 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to .pth")
     parser.add_argument("--data-dir", default="../data")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--viterbi-onset-penalty", type=float, default=2.0,
+                        help="Penalty for voiced<->unvoiced transitions in Viterbi decoding")
+    parser.add_argument("--viterbi-voicing-threshold", type=float, default=0.3,
+                        help="Initial frame threshold for enabling voiced states in Viterbi")
+    parser.add_argument("--vad-viterbi-weight", type=float, default=0.0,
+                        help="Weight for optional VAD-guided Viterbi observation term")
+    parser.add_argument("--viterbi-voiced-bias", type=float, default=0.0,
+                        help="Additive log-prior that favors voiced states in Viterbi")
     parser.add_argument("--csv", default=None, help="Save per-clip CSV")
     parser.add_argument("--json", default=None, help="Save summary JSON")
     args = parser.parse_args()
@@ -254,7 +280,15 @@ def main():
     # Run evaluation
     test_path = os.path.join(args.data_dir, 'test.npz')
     t0 = time.time()
-    results = evaluate_model(model, test_path, device=args.device)
+    results = evaluate_model(
+        model,
+        test_path,
+        device=args.device,
+        viterbi_onset_penalty=args.viterbi_onset_penalty,
+        viterbi_voicing_threshold=args.viterbi_voicing_threshold,
+        vad_viterbi_weight=args.vad_viterbi_weight,
+        viterbi_voiced_bias=args.viterbi_voiced_bias,
+    )
     dt = time.time() - t0
 
     # Report
