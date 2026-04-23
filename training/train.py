@@ -211,7 +211,17 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
     This stub returns ``mel_clean`` unchanged so the trainer runs without
     augmentation until you add the above (or your own variant).
     """
-    return mel_clean
+    B = mel_clean.size(0)
+    # Per-sample: 30% chance of staying clean, 70% chance of noise mixing.
+    # Preserves clean-RPA sharpness while keeping noise robustness.
+    clean_prob = 0.3
+    use_noisy = torch.rand(B, 1, 1, device=device) > clean_prob
+
+    snr_db = (torch.rand(B, 1, 1, device=device)
+              * (snr_range[1] - snr_range[0]) + snr_range[0])
+    gain_offset = -snr_db * (np.log(10.0) / 20.0)
+    noisy = torch.logaddexp(mel_clean, mel_noise + gain_offset)
+    return torch.where(use_noisy, noisy, mel_clean)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -230,7 +240,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         # Move data to the training device (CPU or GPU)
         mel_clean = mel_clean.to(device)
         mel_noise = mel_noise.to(device)
-        vad_target = (f0_target > 0).float().to(device) #changes /////
+        vad_target = vad_target.to(device)  # RMS-based VAD label (matches eval VAD Acc)
         B = mel_clean.size(0)
         T = mel_clean.size(1)
 
@@ -254,8 +264,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         vad_loss = bce(pred_vad.squeeze(-1), vad_target).mean()
 
         # Pitch loss: BCE on the 360-dim posteriorgram, but weighted
-        # by VAD — we don't penalize pitch errors on silent frames
-        voiced_weight = vad_target.unsqueeze(-1)  # (B, T, 1)
+        # by f0>0 — pitch head learns on every RMVPE-voiced frame,
+        # independent of the RMS-based VAD label used above
+        voiced_weight = (f0_target > 0).float().unsqueeze(-1).to(device)  # (B, T, 1)
         pitch_loss = (voiced_weight * bce(pred_pitch, pitch_target)).mean()
 
         # Combined loss (weighted sum)

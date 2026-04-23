@@ -143,7 +143,7 @@ def f0_to_posteriorgram(f0_hz, n_frames=None, sigma_bins=1.2):
 
 
 def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
-                   onset_penalty=1.0):
+                   onset_penalty=0.38):
     """Decode a pitch posteriorgram into a smooth f0 track using Viterbi.
 
     The Viterbi algorithm finds the most likely sequence of pitch states
@@ -246,7 +246,7 @@ def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
 
 
 def viterbi_decode_realtime(posteriorgram, transition_width=12,
-                          voicing_threshold=0.3, onset_penalty=1.0):
+                          voicing_threshold=0.3, onset_penalty=0.38):
     """Realtime (greedy) Viterbi — matches the C/WASM deployment exactly.
 
     Unlike the offline version, this processes frames left-to-right and
